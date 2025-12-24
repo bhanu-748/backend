@@ -3,7 +3,6 @@ const { createClient } = require("../config/dbClient");
 exports.migrateData = async (req, res) => {
   const { source, destination, mapping } = req.body;
 
-  // --------------------- VALIDATION LAYER ---------------------
   if (!source || !destination) {
     return res.json({
       success: false,
@@ -11,10 +10,10 @@ exports.migrateData = async (req, res) => {
     });
   }
 
-  if (!source.table || !destination.table) {
+  if (!destination.table) {
     return res.json({
       success: false,
-      message: "Source and Destination tables must be selected ❌",
+      message: "Destination table must be selected ❌",
     });
   }
 
@@ -25,6 +24,20 @@ exports.migrateData = async (req, res) => {
     });
   }
 
+  const sourceTables =
+    source.tables && source.tables.length > 0
+      ? source.tables
+      : source.table
+      ? [source.table]
+      : [];
+
+  if (sourceTables.length === 0) {
+    return res.json({
+      success: false,
+      message: "No source tables provided ❌",
+    });
+  }
+
   const sourceClient = createClient(source);
   const destClient = createClient(destination);
 
@@ -32,38 +45,17 @@ exports.migrateData = async (req, res) => {
     await sourceClient.connect();
     await destClient.connect();
 
-    const sourceTable = `"${source.table}"`;
     const destinationTable = `"${destination.table}"`;
 
-    // --------------------- VALIDATE COLUMNS EXIST ---------------------
-    const srcColsQuery = `
+    // ✅ Validate DESTINATION columns only
+    const destColsResult = await destClient.query(`
       SELECT column_name 
       FROM information_schema.columns 
-      WHERE table_schema='public' AND table_name='${source.table}'
-    `;
-    const destColsQuery = `
-      SELECT column_name 
-      FROM information_schema.columns 
-      WHERE table_schema='public' AND table_name='${destination.table}'
-    `;
-
-    const srcColsResult = await sourceClient.query(srcColsQuery);
-    const destColsResult = await destClient.query(destColsQuery);
-
-    const srcCols = srcColsResult.rows.map(r => r.column_name);
+      WHERE table_schema='public' 
+      AND table_name='${destination.table}'
+    `);
     const destCols = destColsResult.rows.map(r => r.column_name);
 
-    // Validate source mapping columns exist
-    for (let col of Object.keys(mapping)) {
-      if (!srcCols.includes(col)) {
-        return res.json({
-          success: false,
-          message: `Source column '${col}' does not exist ❌`,
-        });
-      }
-    }
-
-    // Validate destination mapping columns exist
     for (let col of Object.values(mapping)) {
       if (!destCols.includes(col)) {
         return res.json({
@@ -73,54 +65,66 @@ exports.migrateData = async (req, res) => {
       }
     }
 
-    // --------------------- FETCH SOURCE DATA ---------------------
-    const sourceResult = await sourceClient.query(
-      `SELECT * FROM ${sourceTable}`
-    );
+    let totalRecords = 0;
+    let inserted = 0;
+    let failed = 0;
 
-    const rows = sourceResult.rows;
+    // 🔥 PROCESS EACH SOURCE TABLE
+    for (const table of sourceTables) {
+      const tableName = `"${table}"`;
 
-    if (rows.length === 0) {
-      return res.json({
-        success: true,
-        message: "No data found in source table",
-        totalRecords: 0,
-      });
-    }
+      const srcColsResult = await sourceClient.query(`
+        SELECT column_name 
+        FROM information_schema.columns 
+        WHERE table_schema='public' 
+        AND table_name='${table}'
+      `);
 
-    // --------------------- PREPARE INSERT ---------------------
-    const sourceColumns = Object.keys(mapping);
-    const destColumns = Object.values(mapping);
+      const srcCols = srcColsResult.rows.map(r => r.column_name);
 
-    const insertQuery = `
-      INSERT INTO ${destinationTable} (${destColumns.join(",")})
-      VALUES (${destColumns.map((_, i) => `$${i + 1}`).join(",")})
-      ON CONFLICT DO NOTHING
-    `;
+      // ✅ Pick only mappings that exist in this table
+      const validMappings = Object.keys(mapping)
+        .filter(src => srcCols.includes(src))
+        .reduce((obj, key) => {
+          obj[key] = mapping[key];
+          return obj;
+        }, {});
 
-    let successCount = 0;
-    let failCount = 0;
+      // If this table has nothing mapped → skip
+      if (!Object.keys(validMappings).length) continue;
 
-    // --------------------- INSERT RECORDS ---------------------
-    for (const row of rows) {
-      const values = sourceColumns.map((col) => row[col]);
+      const sourceColumns = Object.keys(validMappings);
+      const destColumns = Object.values(validMappings);
 
-      try {
-        await destClient.query(insertQuery, values);
-        successCount++;
-      } catch (err) {
-        console.error("Insert failed:", err.message);
-        failCount++;
+      const insertQuery = `
+        INSERT INTO ${destinationTable} (${destColumns.join(",")})
+        VALUES (${destColumns.map((_, i) => `$${i + 1}`).join(",")})
+        ON CONFLICT DO NOTHING
+      `;
+
+      const result = await sourceClient.query(`SELECT * FROM ${tableName}`);
+      const rows = result.rows;
+      totalRecords += rows.length;
+
+      for (const row of rows) {
+        try {
+          const values = sourceColumns.map(col => row[col] ?? null);
+          await destClient.query(insertQuery, values);
+          inserted++;
+        } catch (err) {
+          console.log(`Insert failed in table ${table}:`, err.message);
+          failed++;
+        }
       }
     }
 
     return res.json({
       success: true,
-      message: "Migration Completed 👍",
-      totalRecords: rows.length,
-      inserted: successCount,
-      failed: failCount,
-      skippedDuplicates: rows.length - successCount - failCount,
+      message: "Multi-table Migration Completed 👍",
+      totalRecords,
+      inserted,
+      skippedDuplicates: totalRecords - inserted - failed,
+      failed,
     });
 
   } catch (err) {
@@ -133,7 +137,7 @@ exports.migrateData = async (req, res) => {
     });
 
   } finally {
-    await sourceClient.end();
-    await destClient.end();
+    try { await sourceClient.end(); } catch {}
+    try { await destClient.end(); } catch {}
   }
 };
