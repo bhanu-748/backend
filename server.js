@@ -5,6 +5,7 @@ const cors = require("cors");
 const sourceRoutes = require("./routes/sourceRoutes");
 const destinationRoutes = require("./routes/destinationRoutes");
 const migrationRoutes = require("./routes/migrationRoutes");
+const schemaRoutes = require("./routes/schemaRoutes");
 
 
 
@@ -12,6 +13,7 @@ const app = express();
 
 app.use(cors());
 app.use(express.json());
+
 
 app.get("/", (req, res) => {
   res.send("Backend is working 👍");
@@ -21,6 +23,7 @@ app.get("/", (req, res) => {
 app.use("/source", sourceRoutes);
 app.use("/destination", destinationRoutes);
 app.use("/migration", migrationRoutes);
+app.use("/schema", schemaRoutes);
 
 
 
